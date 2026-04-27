@@ -186,95 +186,73 @@ async function downloadOne(context, doi, title, total, retry = 0) {
   const outPath = path.join(DOWNLOAD_DIR, fname);
 
   // Build the viewer URL directly from the DOI
-  // enc = base64( doi + "&&&&&40&&&&&Search&&&&&fullscreen&&&&&false&&&&&&&&&&Phrase&&&&&DocumentResult&&&&&false&&&&&&&&&&" )
-  const enc     = Buffer.from(doi + '&&&&&40&&&&&Search&&&&&fullscreen&&&&&false&&&&&&&&&&Phrase&&&&&DocumentResult&&&&&false&&&&&&&&&&').toString('base64');
+  const enc       = Buffer.from(doi + '&&&&&40&&&&&Search&&&&&fullscreen&&&&&false&&&&&&&&&&Phrase&&&&&DocumentResult&&&&&false&&&&&&&&&&').toString('base64');
   const viewerUrl = `https://www.scconline.com/Members/DocumentResult.aspx?enc=${enc}`;
 
   const page = await context.newPage();
 
   try {
-    // Log all network requests to find the PDF endpoint
-    let pdfBuf = null;
-    const seenUrls = [];
+    await page.goto(viewerUrl, { waitUntil: 'commit', timeout: 60000 });
 
-    page.on('response', async (response) => {
-      try {
-        const url = response.url();
-        const ct  = response.headers()['content-type'] || '';
-        seenUrls.push({ url, ct, status: response.status() });
+    // Wait specifically for the SCC document container to fill with text
+    await page.waitForFunction(() => {
+      const el = document.querySelector('#divSearchedResults');
+      return el && el.innerText && el.innerText.trim().length > 500;
+    }, { timeout: 45000 });
 
-        if (ct.includes('pdf') || url.includes('.pdf') || url.includes('DownloadFile') || url.includes('GetPdf') || url.includes('ViewPdf') || url.includes('ShowPdf')) {
-          const buf = await response.body();
-          if (buf && buf.length > 500 && buf[0] === 0x25 && buf[1] === 0x50) {
-            pdfBuf = buf;
-            console.log(`\n  [pdf found] ${url} (${buf.length} bytes)`);
-          }
-        }
-      } catch (_) {}
+    // Wait for fonts to be ready and let any final reflow happen
+    await page.evaluate(() => document.fonts && document.fonts.ready).catch(() => {});
+    await sleep(2000);
+
+    // Force the page to use a sane print width so content actually paints
+    await page.emulateMedia({ media: 'screen' });
+
+    // Isolate the document container so PDF contains only the document.
+    // We move #divSearchedResults to be the only visible element on the page.
+    await page.evaluate(() => {
+      const doc = document.querySelector('#divSearchedResults');
+      if (doc) {
+        // Clone the content and replace body with just the document
+        const newBody = document.createElement('div');
+        newBody.style.cssText = 'padding:30px;font-family:Georgia,serif;line-height:1.6;color:#000;background:#fff;max-width:100%;';
+        newBody.innerHTML = doc.innerHTML;
+        document.body.innerHTML = '';
+        document.body.appendChild(newBody);
+        document.body.style.cssText = 'background:#fff;margin:0;';
+        // Kill any leftover fixed/absolute elements
+        document.querySelectorAll('[style*="position:fixed"], [style*="position: fixed"]').forEach(el => el.remove());
+      }
+    }).catch(() => {});
+
+    await sleep(500);
+
+    // Print to PDF
+    await page.pdf({
+      path: outPath,
+      format: 'A4',
+      printBackground: true,
+      margin: { top: '15mm', bottom: '15mm', left: '15mm', right: '15mm' },
     });
 
-    console.log(`\n  [trying] ${title.slice(0,60)} [${doi}]`);
-    try {
-      await page.goto(viewerUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    } catch (e) {
-      console.log(`  [nav warn] ${e.message}`);
-    }
+    // Sanity check the resulting file
+    const stat = fs.statSync(outPath);
+    if (stat.size < 1000) throw new Error(`PDF too small (${stat.size} bytes)`);
 
-    // Wait for PDF to load (poll for up to 15s)
-    for (let i = 0; i < 15; i++) {
-      if (pdfBuf) break;
-      await sleep(1000);
-    }
-
-    if (!pdfBuf) {
-      console.log(`  [no pdf intercepted] dumping last 30 URLs the page requested:`);
-      seenUrls.slice(-30).forEach(r => console.log(`    [${r.status}] ${r.ct.slice(0,30).padEnd(30)} ${r.url.slice(0,120)}`));
-    }
-
-    if (pdfBuf) {
-      fs.writeFileSync(outPath, pdfBuf);
-      progress[doi] = 'done';
-      saveProgress();
-      dlCount++;
-      process.stdout.write(`\r  ✓ ${dlCount}/${total}  skip:${skipCount}  fail:${failCount}   `);
-      await sleep(DL_DELAY);
-      await page.close();
-      return;
-    }
-
-    // PDF not intercepted via network — try triggering a download via the page's own print/download button
-    try {
-      const [download] = await Promise.all([
-        page.waitForEvent('download', { timeout: 10000 }),
-        page.evaluate(() => {
-          // Try common download button selectors SCC uses
-          const btn = document.querySelector('#btnDownload, #lnkDownload, .download-btn, [onclick*="download"], [onclick*="Download"], [href*="DownloadFile"]');
-          if (btn) btn.click();
-        }),
-      ]);
-      const tmpPath = await download.path();
-      if (tmpPath) {
-        const buf = fs.readFileSync(tmpPath);
-        if (buf.length > 500 && buf[0] === 0x25 && buf[1] === 0x50) {
-          fs.copyFileSync(tmpPath, outPath);
-          progress[doi] = 'done';
-          saveProgress();
-          dlCount++;
-          process.stdout.write(`\r  ✓ ${dlCount}/${total}  skip:${skipCount}  fail:${failCount}   `);
-          await sleep(DL_DELAY);
-          await page.close();
-          return;
-        }
-      }
-    } catch (_) {}
+    progress[doi] = 'done';
+    saveProgress();
+    dlCount++;
+    process.stdout.write(`\r  ✓ ${dlCount}/${total}  skip:${skipCount}  fail:${failCount}   `);
+    await sleep(DL_DELAY);
+    await page.close();
+    return;
 
   } catch (e) {
-    console.log(`\n  [err] ${title}: ${e.message}`);
+    console.log(`\n  [err] ${title.slice(0,50)}: ${e.message}`);
   } finally {
     await page.close().catch(() => {});
   }
 
-  // All strategies failed (retries disabled for debug)
+  // Retries disabled for debug
 
   progress[doi] = 'failed';
   saveProgress();
@@ -373,8 +351,8 @@ async function main() {
   console.log(`  Saving to : ${path.resolve(DOWNLOAD_DIR)}`);
   console.log('\n  Ctrl+C anytime — progress saved, restart to resume\n');
 
-  const testDocs = allDocs.slice(0, 2);
-  console.log(`  TEST MODE: only downloading first ${testDocs.length} docs (concurrency=1 for debug)\n`);
+  const testDocs = allDocs.slice(0, 1);
+  console.log(`  DEBUG MODE: only downloading first ${testDocs.length} doc\n`);
   await runPool(
     testDocs.map(d => () => downloadOne(context, d.doi, d.title, testDocs.length)),
     1
