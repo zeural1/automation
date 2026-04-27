@@ -185,54 +185,96 @@ async function downloadOne(context, doi, title, total, retry = 0) {
   const fname   = sanitize(title) + '__' + doi.replace(/[^a-zA-Z0-9\-]/g,'_') + '.pdf';
   const outPath = path.join(DOWNLOAD_DIR, fname);
 
-  const endpoints = [
-    `https://www.scconline.com/Members/DownloadFile.aspx?fileType=pdf&doi=${doi}`,
-    `https://www.scconline.com/Members/DownloadFile.aspx?doi=${doi}&fileType=pdf`,
-    `https://www.scconline.com/DocumentLink/${doi}`,
-  ];
+  // Build the viewer URL directly from the DOI
+  // enc = base64( doi + "&&&&&40&&&&&Search&&&&&fullscreen&&&&&false&&&&&&&&&&Phrase&&&&&DocumentResult&&&&&false&&&&&&&&&&" )
+  const enc     = Buffer.from(doi + '&&&&&40&&&&&Search&&&&&fullscreen&&&&&false&&&&&&&&&&Phrase&&&&&DocumentResult&&&&&false&&&&&&&&&&').toString('base64');
+  const viewerUrl = `https://www.scconline.com/Members/DocumentResult.aspx?enc=${enc}`;
 
   const page = await context.newPage();
 
   try {
-    for (const url of endpoints) {
-      try {
-        // waitForEvent('download') catches both direct PDF responses
-        // AND JavaScript-triggered blob/download events
-        const [download] = await Promise.all([
-          page.waitForEvent('download', { timeout: 20000 }),
-          page.goto(url, { waitUntil: 'commit', timeout: 20000 }),
-        ]);
+    // Log all network requests to find the PDF endpoint
+    let pdfBuf = null;
+    const seenUrls = [];
 
-        const tmpPath = await download.path();
-        if (tmpPath) {
-          // Verify it's actually a PDF
-          const buf = fs.readFileSync(tmpPath);
-          const isPDF = buf[0] === 0x25 && buf[1] === 0x50; // %P
-          if (buf.length > 500 && isPDF) {
-            fs.copyFileSync(tmpPath, outPath);
-            progress[doi] = 'done';
-            saveProgress();
-            dlCount++;
-            process.stdout.write(`\r  ✓ ${dlCount}/${total}  skip:${skipCount}  fail:${failCount}   `);
-            await sleep(DL_DELAY);
-            await page.close();
-            return;
+    page.on('response', async (response) => {
+      try {
+        const url = response.url();
+        const ct  = response.headers()['content-type'] || '';
+        seenUrls.push({ url, ct, status: response.status() });
+
+        if (ct.includes('pdf') || url.includes('.pdf') || url.includes('DownloadFile') || url.includes('GetPdf') || url.includes('ViewPdf') || url.includes('ShowPdf')) {
+          const buf = await response.body();
+          if (buf && buf.length > 500 && buf[0] === 0x25 && buf[1] === 0x50) {
+            pdfBuf = buf;
+            console.log(`\n  [pdf found] ${url} (${buf.length} bytes)`);
           }
         }
-      } catch (_) {
-        // download event didn't fire (page returned HTML, not a download)
-        // try next endpoint
-      }
+      } catch (_) {}
+    });
+
+    console.log(`\n  [trying] ${title.slice(0,60)} [${doi}]`);
+    try {
+      await page.goto(viewerUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    } catch (e) {
+      console.log(`  [nav warn] ${e.message}`);
     }
+
+    // Wait for PDF to load (poll for up to 15s)
+    for (let i = 0; i < 15; i++) {
+      if (pdfBuf) break;
+      await sleep(1000);
+    }
+
+    if (!pdfBuf) {
+      console.log(`  [no pdf intercepted] dumping last 30 URLs the page requested:`);
+      seenUrls.slice(-30).forEach(r => console.log(`    [${r.status}] ${r.ct.slice(0,30).padEnd(30)} ${r.url.slice(0,120)}`));
+    }
+
+    if (pdfBuf) {
+      fs.writeFileSync(outPath, pdfBuf);
+      progress[doi] = 'done';
+      saveProgress();
+      dlCount++;
+      process.stdout.write(`\r  ✓ ${dlCount}/${total}  skip:${skipCount}  fail:${failCount}   `);
+      await sleep(DL_DELAY);
+      await page.close();
+      return;
+    }
+
+    // PDF not intercepted via network — try triggering a download via the page's own print/download button
+    try {
+      const [download] = await Promise.all([
+        page.waitForEvent('download', { timeout: 10000 }),
+        page.evaluate(() => {
+          // Try common download button selectors SCC uses
+          const btn = document.querySelector('#btnDownload, #lnkDownload, .download-btn, [onclick*="download"], [onclick*="Download"], [href*="DownloadFile"]');
+          if (btn) btn.click();
+        }),
+      ]);
+      const tmpPath = await download.path();
+      if (tmpPath) {
+        const buf = fs.readFileSync(tmpPath);
+        if (buf.length > 500 && buf[0] === 0x25 && buf[1] === 0x50) {
+          fs.copyFileSync(tmpPath, outPath);
+          progress[doi] = 'done';
+          saveProgress();
+          dlCount++;
+          process.stdout.write(`\r  ✓ ${dlCount}/${total}  skip:${skipCount}  fail:${failCount}   `);
+          await sleep(DL_DELAY);
+          await page.close();
+          return;
+        }
+      }
+    } catch (_) {}
+
+  } catch (e) {
+    console.log(`\n  [err] ${title}: ${e.message}`);
   } finally {
     await page.close().catch(() => {});
   }
 
-  // All endpoints failed
-  if (retry < 3) {
-    await sleep(4000 * (retry + 1));
-    return downloadOne(context, doi, title, total, retry + 1);
-  }
+  // All strategies failed (retries disabled for debug)
 
   progress[doi] = 'failed';
   saveProgress();
@@ -271,14 +313,7 @@ async function main() {
     timeout: 30000,
   });
 
-  const pageText = await apiPage.content();
-  if (pageText.toLowerCase().includes('login')) {
-    console.log('✗ Session appears expired or invalid.');
-    console.log(`  Delete ${SESSION_FILE} and re-run to log in again.\n`);
-    await browser.close();
-    process.exit(1);
-  }
-  console.log('✓ Session active\n');
+
 
   // Validate API
   process.stdout.write('Testing API... ');
@@ -338,9 +373,11 @@ async function main() {
   console.log(`  Saving to : ${path.resolve(DOWNLOAD_DIR)}`);
   console.log('\n  Ctrl+C anytime — progress saved, restart to resume\n');
 
+  const testDocs = allDocs.slice(0, 2);
+  console.log(`  TEST MODE: only downloading first ${testDocs.length} docs (concurrency=1 for debug)\n`);
   await runPool(
-    allDocs.map(d => () => downloadOne(context, d.doi, d.title, allDocs.length)),
-    CONCURRENCY
+    testDocs.map(d => () => downloadOne(context, d.doi, d.title, testDocs.length)),
+    1
   );
 
   await browser.close();
